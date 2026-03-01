@@ -48,9 +48,8 @@ impl FileScanner {
         let mut dir_info = DirectoryInfo {
             path: path.to_path_buf(),
             name: path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Unknown".to_string()),
             children: Vec::new(),
             image_files: Vec::new(),
         };
@@ -70,13 +69,19 @@ impl FileScanner {
                     dir_info.children.push(child_info);
                 }
             } else if self.is_supported_image(&path) {
+                // Skip hidden files (starting with ._)
+                if let Some(filename) = path.file_name() {
+                    if filename.to_string_lossy().starts_with("._") {
+                        continue;
+                    }
+                }
+                
                 if let Ok(metadata) = entry.metadata() {
                     let image_file = ImageFile {
                         path: path.clone(),
                         name: path.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string(),
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "Unknown".to_string()),
                         modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                         size: metadata.len(),
                     };
@@ -85,8 +90,9 @@ impl FileScanner {
             }
         }
 
-        dir_info.children.sort_by(|a, b| a.name.cmp(&b.name));
-        dir_info.image_files.sort_by(|a, b| a.name.cmp(&b.name));
+        // Sort by name using natural ordering for better Japanese support
+        dir_info.children.sort_by(|a, b| natord::compare(&a.name, &b.name));
+        dir_info.image_files.sort_by(|a, b| natord::compare(&a.name, &b.name));
 
         Ok(dir_info)
     }
