@@ -1,0 +1,15 @@
+[alias]
+check-all = "check --workspace --all-targets --all-features"
+test-all = "test --workspace --all-targets --all-features"
+clippy-all = "clippy --workspace --all-targets --all-features"
+fmt-all = "fmt --all"
+
+[build]
+# Parallelize builds
+jobs = 4
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,@loader_path"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,@loader_path"]
