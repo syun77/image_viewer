@@ -1,9 +1,11 @@
 mod loading;
 
 use eframe::egui;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use crate::core::{
     file_scanner::{FileScanner, ImageFile},
@@ -18,9 +20,12 @@ pub struct ThumbnailGrid {
     selected_index: Option<usize>,
     thumbnails: HashMap<PathBuf, egui::TextureHandle>,
     loading_thumbnails: std::collections::HashSet<PathBuf>,
+    loading_started_at: HashMap<PathBuf, Instant>,
     thumbnail_size: f32,
     grid_cols: usize,
     priority_load_queue: VecDeque<PathBuf>,
+    thumbnail_result_sender: Sender<(PathBuf, image::DynamicImage)>,
+    thumbnail_result_receiver: Receiver<(PathBuf, image::DynamicImage)>,
 }
 
 impl ThumbnailGrid {
@@ -28,6 +33,8 @@ impl ThumbnailGrid {
         file_scanner: Arc<Mutex<FileScanner>>,
         thumbnail_cache: Arc<Mutex<ThumbnailCache>>,
     ) -> Self {
+        let (thumbnail_result_sender, thumbnail_result_receiver) = mpsc::channel();
+
         Self {
             file_scanner,
             thumbnail_cache,
@@ -35,9 +42,12 @@ impl ThumbnailGrid {
             selected_index: None,
             thumbnails: HashMap::new(),
             loading_thumbnails: std::collections::HashSet::new(),
+            loading_started_at: HashMap::new(),
             thumbnail_size: 160.0,
             grid_cols: 1,
             priority_load_queue: VecDeque::new(),
+            thumbnail_result_sender,
+            thumbnail_result_receiver,
         }
     }
 
@@ -47,6 +57,7 @@ impl ThumbnailGrid {
         self.selected_index = None;
         self.thumbnails.clear();
         self.loading_thumbnails.clear();
+        self.loading_started_at.clear();
         self.priority_load_queue.clear();
     }
     
@@ -101,7 +112,9 @@ impl ThumbnailGrid {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, thumbnail_size: f32, is_focused: bool, viewer_open: bool, loading_state: &LoadingState) -> (Option<usize>, bool, bool) {
-            println!("[show] current_images.len() = {}", self.current_images.len());
+        self.cleanup_stale_loading();
+        self.process_thumbnail_results(ui.ctx());
+        println!("[show] current_images.len() = {}", self.current_images.len());
         self.thumbnail_size = thumbnail_size;
         let mut selected_image = None;
         let mut was_clicked = false;
@@ -523,6 +536,30 @@ impl ThumbnailGrid {
             ui.label(format!("スキャン中... ({} / {} 個の画像が表示中)", loaded_images, total_images));
         });
         ui.separator();
+    }
+}
+
+impl ThumbnailGrid {
+    fn cleanup_stale_loading(&mut self) {
+        let now = Instant::now();
+        let timeout = Duration::from_secs(20);
+
+        let stale_paths: Vec<PathBuf> = self
+            .loading_started_at
+            .iter()
+            .filter_map(|(path, started)| {
+                if now.duration_since(*started) > timeout {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for path in stale_paths {
+            self.loading_started_at.remove(&path);
+            self.loading_thumbnails.remove(&path);
+        }
     }
 }
 
