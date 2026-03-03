@@ -21,11 +21,11 @@ fn main() -> Result<(), eframe::Error> {
         Box::new(|cc| {
             // Setup Japanese font support
             setup_custom_fonts(&cc.egui_ctx);
-            
+
             // Enable continuous mode for high-frequency updates
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            
-            Ok(Box::new(ImageViewerApp::new(cc)))
+
+            Ok(Box::new(ImageViewerApp::new(cc)) as Box<dyn eframe::App>)
         }),
     )
 }
@@ -38,10 +38,10 @@ fn setup_custom_fonts(ctx: &egui::Context) {
     // macOSで日本語フォントを追加
     // システムにインストールされている可能性の高いフォントファイルを試す
     let japanese_font_paths = [
+        "/System/Library/Fonts/Apple SD Gothic Neo.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/System/Library/Fonts/PingFang.ttc", 
         "/Library/Fonts/Arial Unicode.ttf",
-        "/System/Library/Fonts/Apple SD Gothic Neo.ttc",
     ];
     
     let mut font_added = false;

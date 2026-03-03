@@ -1,3 +1,5 @@
+mod loading;
+
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -6,7 +8,6 @@ use std::collections::{HashMap, VecDeque};
 use crate::core::{
     file_scanner::{FileScanner, ImageFile},
     thumbnail_cache::ThumbnailCache,
-    image_loader::ImageLoader,
 };
 use crate::ui::app::LoadingState;
 
@@ -407,117 +408,6 @@ impl ThumbnailGrid {
         });
     }
     
-    fn load_thumbnail_async(&mut self, path: &PathBuf, ctx: &egui::Context) {
-        if self.loading_thumbnails.contains(path) {
-            return;
-        }
-        
-        self.loading_thumbnails.insert(path.clone());
-        
-        // For now, do synchronous loading but mark as loading for UI feedback
-        self.load_thumbnail_sync(path.clone(), ctx);
-    }
-    
-    fn load_thumbnail_sync(&mut self, path: PathBuf, ctx: &egui::Context) {
-        let image_file = self.current_images.iter()
-            .find(|img| img.path == path)
-            .cloned();
-            
-        if let Some(image_file) = image_file {
-            self.load_thumbnail(ctx, image_file);
-        }
-    }
-
-    fn load_thumbnail(&mut self, ctx: &egui::Context, image_file: ImageFile) {
-        // Mark as loading to prevent duplicate loading attempts
-        self.loading_thumbnails.insert(image_file.path.clone());
-        
-        let cache_key = crate::core::thumbnail_cache::ThumbnailCache::generate_key(
-            &image_file.path,
-            image_file.modified,
-            image_file.size,
-        );
-        
-        // Check cache first
-        if let Ok(mut cache) = self.thumbnail_cache.lock() {
-            if let Some(thumbnail) = cache.get(&cache_key) {
-                // Convert to texture
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [thumbnail.width() as usize, thumbnail.height() as usize],
-                    &thumbnail.to_rgba8(),
-                );
-                
-                let texture_id = format!("thumbnail_{}_{}", 
-                    image_file.path.file_name().unwrap_or_default().to_string_lossy(),
-                    image_file.modified.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
-                );
-                
-                let texture = ctx.load_texture(
-                    texture_id,
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                );
-                
-                self.thumbnails.insert(image_file.path.clone(), texture);
-                self.loading_thumbnails.remove(&image_file.path);
-                return;
-            }
-        }
-        
-        // Load thumbnail synchronously to avoid thread spawn issues
-        match ImageLoader::load_thumbnail(&image_file.path, 160) {
-            Ok(thumbnail) => {
-                // Store in cache
-                if let Ok(mut cache) = self.thumbnail_cache.lock() {
-                    cache.put(cache_key, thumbnail.clone());
-                }
-                
-                // Convert to texture with unique ID
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [thumbnail.width() as usize, thumbnail.height() as usize],
-                    &thumbnail.to_rgba8(),
-                );
-                
-                let texture_id = format!("thumbnail_{}_{}", 
-                    image_file.path.file_name().unwrap_or_default().to_string_lossy(),
-                    image_file.modified.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
-                );
-                
-                let texture = ctx.load_texture(
-                    texture_id,
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                );
-                
-                self.thumbnails.insert(image_file.path.clone(), texture);
-                self.loading_thumbnails.remove(&image_file.path);
-                
-                // Request repaint to update UI
-                ctx.request_repaint();
-            }
-            Err(e) => {
-                println!("Failed to load thumbnail for {}: {}", image_file.path.display(), e);
-                // Remove from loading set if failed and create an error placeholder
-                self.loading_thumbnails.remove(&image_file.path);
-                
-                // Create error placeholder texture
-                let error_image = create_error_placeholder_image();
-                let texture_id = format!("error_{}_{}", 
-                    image_file.path.file_name().unwrap_or_default().to_string_lossy(),
-                    image_file.modified.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
-                );
-                
-                let texture = ctx.load_texture(
-                    texture_id,
-                    error_image,
-                    egui::TextureOptions::LINEAR,
-                );
-                
-                self.thumbnails.insert(image_file.path.clone(), texture);
-            }
-        }
-    }
-
     fn handle_keyboard_input(&mut self, ui: &mut egui::Ui, cols: usize) -> (bool, bool) {
         let mut selection_changed = false;
         let mut should_open_viewer = false;
@@ -625,6 +515,15 @@ impl ThumbnailGrid {
     pub fn get_current_images(&self) -> Vec<ImageFile> {
         self.current_images.clone()
     }
+    
+    pub fn update_progress(&self, ui: &mut egui::Ui, total_images: usize) {
+        let loaded_images = self.current_images.len();
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(format!("スキャン中... ({} / {} 個の画像が表示中)", loaded_images, total_images));
+        });
+        ui.separator();
+    }
 }
 
 // Helper function to create error placeholder image
@@ -647,4 +546,9 @@ fn create_error_placeholder_image() -> egui::ColorImage {
         [size, size],
         &pixels.iter().flat_map(|c| [c.r(), c.g(), c.b(), c.a()]).collect::<Vec<u8>>()
     )
+}
+
+// Moved the println! statement into a valid function or block context
+fn debug_thumbnail_cache() {
+    println!("Debug: Checking thumbnail cache and loader");
 }

@@ -2,6 +2,7 @@ use image::{DynamicImage, GenericImageView};
 use std::path::Path;
 use anyhow::{Result, anyhow};
 use log::info;
+use crate::core::thumbnail_cache::ThumbnailCache;
 
 pub struct ImageLoader;
 
@@ -27,14 +28,43 @@ impl ImageLoader {
             ((orig_width as f32 * ratio) as u32, target_size)
         };
 
+        let new_width = new_width.max(1);
+        let new_height = new_height.max(1);
+
         // Use simple resize method
         let resized = img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
         info!("Generated thumbnail in {:?}", start_time.elapsed());
         Ok(resized)
     }
 
-    pub fn load_thumbnail(path: &Path, target_size: u32) -> Result<DynamicImage> {
-        let img = Self::load_image(path)?;
-        Self::generate_thumbnail(&img, target_size)
+    pub fn load_thumbnail(path: &Path, target_size: u32, cache: &mut ThumbnailCache) -> Result<DynamicImage> {
+        match Self::load_image(path) {
+            Ok(img) => {
+                match Self::generate_thumbnail(&img, target_size) {
+                    Ok(thumbnail) => {
+                        if let Ok(metadata) = std::fs::metadata(path) {
+                            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                            let cache_key = ThumbnailCache::generate_key(
+                                &path.to_path_buf(),
+                                modified,
+                                metadata.len(),
+                            );
+                            cache.put(cache_key, thumbnail.clone());
+                        }
+                        Ok(thumbnail)
+                    }
+                    Err(e) => {
+                        log::error!("Failed to generate thumbnail for {}: {}", path.display(), e);
+                        // Return a placeholder image on failure
+                        Ok(DynamicImage::new_rgba8(target_size, target_size))
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to load image {}: {}", path.display(), e);
+                // Return a placeholder image on failure
+                Ok(DynamicImage::new_rgba8(target_size, target_size))
+            }
+        }
     }
 }

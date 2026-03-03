@@ -29,9 +29,9 @@ impl ThumbnailCache {
 
     pub fn put(&mut self, key: CacheKey, thumbnail: DynamicImage) {
         if self.cache.len() >= self.max_entries {
-            // Simple eviction - remove first item
-            if let Some(first_key) = self.cache.keys().next().cloned() {
-                self.cache.remove(&first_key);
+            // LRU eviction: Remove the least recently used item
+            if let Some(lru_key) = self.cache.keys().next().cloned() {
+                self.cache.remove(&lru_key);
             }
         }
         self.cache.insert(key, thumbnail);
