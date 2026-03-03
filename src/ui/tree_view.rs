@@ -12,6 +12,8 @@ pub struct TreeView {
     selected_path: Option<PathBuf>,
     all_directories: Vec<PathBuf>, // For keyboard navigation
     selected_index: Option<usize>, // For keyboard navigation
+    // Add async image counts for each directory
+    image_counts: HashMap<PathBuf, usize>,
 }
 
 impl TreeView {
@@ -23,6 +25,7 @@ impl TreeView {
             selected_path: None,
             all_directories: Vec::new(),
             selected_index: None,
+            image_counts: HashMap::new(),
         }
     }
 
@@ -181,8 +184,13 @@ impl TreeView {
                 self.selected_index = self.all_directories.iter().position(|p| p == &dir_info.path);
             }
             
-            // Show image count
-            if !dir_info.image_files.is_empty() {
+            // Show image count from async loading instead of sync scan
+            if let Some(count) = self.get_image_count(&dir_info.path) {
+                if count > 0 {
+                    ui.label(format!("({})", count));
+                }
+            } else if !dir_info.image_files.is_empty() {
+                // Fallback to sync count if async count not available yet
                 ui.label(format!("({})", dir_info.image_files.len()));
             }
         });
@@ -204,5 +212,15 @@ impl TreeView {
 
     pub fn get_selected_path(&self) -> Option<&PathBuf> {
         self.selected_path.as_ref()
+    }
+
+    // Update image count for a directory
+    pub fn update_image_count(&mut self, path: &PathBuf, count: usize) {
+        self.image_counts.insert(path.clone(), count);
+    }
+
+    // Get image count for a directory
+    pub fn get_image_count(&self, path: &PathBuf) -> Option<usize> {
+        self.image_counts.get(path).copied()
     }
 }

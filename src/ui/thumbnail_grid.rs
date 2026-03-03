@@ -1,14 +1,14 @@
 use eframe::egui;
-use image::GenericImageView;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::core::{
     file_scanner::{FileScanner, ImageFile},
     thumbnail_cache::ThumbnailCache,
     image_loader::ImageLoader,
 };
+use crate::ui::app::LoadingState;
 
 pub struct ThumbnailGrid {
     file_scanner: Arc<Mutex<FileScanner>>,
@@ -19,6 +19,7 @@ pub struct ThumbnailGrid {
     loading_thumbnails: std::collections::HashSet<PathBuf>,
     thumbnail_size: f32,
     grid_cols: usize,
+    priority_load_queue: VecDeque<PathBuf>,
 }
 
 impl ThumbnailGrid {
@@ -35,34 +36,80 @@ impl ThumbnailGrid {
             loading_thumbnails: std::collections::HashSet::new(),
             thumbnail_size: 160.0,
             grid_cols: 1,
+            priority_load_queue: VecDeque::new(),
         }
     }
 
+    // New method for async loading
+    pub fn clear_images(&mut self) {
+        self.current_images.clear();
+        self.selected_index = None;
+        self.thumbnails.clear();
+        self.loading_thumbnails.clear();
+        self.priority_load_queue.clear();
+    }
+    
+    pub fn set_images(&mut self, images: Vec<ImageFile>) {
+        self.current_images = images;
+        self.selected_index = None;
+        println!("ThumbnailGrid: Set {} images", self.current_images.len());
+    }
+    
+    pub fn add_image(&mut self, image: ImageFile, ctx: &egui::Context) {
+        println!("📁 Found new image file: {} - immediately visible", image.name);
+        self.current_images.push(image.clone());
+        println!("[add_image] current_images.len() = {}", self.current_images.len());
+        // 画像追加時に必ずサムネイル生成を開始
+        self.load_thumbnail_async(&image.path, ctx);
+        // 強制的に複数回repaint
+        ctx.request_repaint();
+        ctx.request_repaint_after(std::time::Duration::from_millis(1));
+        ctx.request_repaint_after(std::time::Duration::from_millis(5));
+    }
+    
+    pub fn prioritize_thumbnail_load(&mut self, path: PathBuf) {
+        if !self.priority_load_queue.contains(&path) {
+            self.priority_load_queue.push_front(path);
+        }
+    }
+    
+    pub fn get_image_path_at_index(&self, index: usize) -> Option<PathBuf> {
+        self.current_images.get(index).map(|img| img.path.clone())
+    }
+
+    // Legacy method - kept for compatibility but now just calls clear_images
     pub fn load_folder(&mut self, path: PathBuf) {
-        if let Ok(scanner) = self.file_scanner.lock() {
-            if let Ok(images) = scanner.scan_images_in_directory(&path) {
-                // Clear old data when loading new folder
-                self.current_images = images;
-                self.selected_index = None;
-                self.thumbnails.clear();
-                self.loading_thumbnails.clear();
-                println!("Loaded {} images from {}", self.current_images.len(), path.display());
+        self.clear_images();
+        
+        let images = {
+            if let Ok(scanner) = self.file_scanner.lock() {
+                scanner.scan_images_in_directory(&path)
             } else {
+                Err(anyhow::anyhow!("Failed to acquire scanner lock"))
+            }
+        };
+        
+        match images {
+            Ok(images) => {
+                self.set_images(images);
+            }
+            Err(_) => {
                 println!("Failed to scan directory: {}", path.display());
             }
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, thumbnail_size: f32, is_focused: bool, viewer_open: bool) -> (Option<usize>, bool, bool) {
+    pub fn show(&mut self, ui: &mut egui::Ui, thumbnail_size: f32, is_focused: bool, viewer_open: bool, loading_state: &LoadingState) -> (Option<usize>, bool, bool) {
+            println!("[show] current_images.len() = {}", self.current_images.len());
         self.thumbnail_size = thumbnail_size;
         let mut selected_image = None;
         let mut was_clicked = false;
         let mut should_open_viewer = false;
         let available_width = ui.available_width();
         // Calculate columns considering padding and margins
-        let padding = ui.style().spacing.item_spacing.x * 2.0; // Left and right padding
+        let padding = ui.style().spacing.item_spacing.x * 2.0 + 10.0; // Add extra padding for better spacing
         let effective_width = (available_width - padding).max(thumbnail_size);
-        let cols = (effective_width / thumbnail_size).max(1.0) as usize;
+        let cols = (effective_width / (thumbnail_size + 10.0)).max(1.0) as usize; // Adjust for spacing between thumbnails
         self.grid_cols = cols;
 
         // Show focus indicator with darker color
@@ -73,9 +120,73 @@ impl ThumbnailGrid {
                 egui::Stroke::new(2.0, egui::Color32::from_rgb(40, 80, 40)), // Darker green
             );
         }
+        
+        // Show loading state when appropriate, but don't prevent normal display after loading
+        match loading_state {
+            LoadingState::Loading => {
+                if self.current_images.is_empty() {
+                    // 画像が1枚もない場合のみテキスト＋spinnerを表示してreturn
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(20.0);
+                        ui.spinner();
+                        ui.label("フォルダをスキャン中...");
+                        ui.label("見つかった画像がすぐに表示されます");
+                        ui.add_space(20.0);
+                    });
+                    return (selected_image, was_clicked, should_open_viewer);
+                } else {
+                    // 画像が1枚でもあれば、グリッド上部にスキャン中テキストを表示し、必ずグリッド描画
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("スキャン中... ({} 個の画像が表示中)", self.current_images.len()));
+                    });
+                    ui.separator();
+                }
+            }
+            LoadingState::Failed(error) => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(50.0);
+                    ui.colored_label(egui::Color32::RED, "Failed to load folder");
+                    ui.label(error);
+                    ui.add_space(20.0);
+                    if ui.button("Retry").clicked() {
+                        // Request to reload - would need to be handled by parent
+                    }
+                });
+                return (selected_image, was_clicked, should_open_viewer);
+            }
+            LoadingState::Loaded | LoadingState::Idle => {
+                // Normal operation - proceed to show images
+            }
+        }
 
+        // Show empty state if no images（ロード完了時のみ）
+        if self.current_images.is_empty() {
+            println!("=== ThumbnailGrid: No images to display - current_images.len() = {} ===", self.current_images.len());
+            ui.vertical_centered(|ui| {
+                ui.add_space(50.0);
+                ui.label("No images found");
+            });
+            return (selected_image, was_clicked, should_open_viewer);
+        }
+
+        println!("=== ThumbnailGrid: About to show {} images in grid ===", self.current_images.len());
+
+        self.show_image_grid(ui, is_focused, viewer_open, &mut selected_image, &mut was_clicked, &mut should_open_viewer);
+
+        (selected_image, was_clicked, should_open_viewer)
+    }
+    
+    fn show_image_grid(&mut self, ui: &mut egui::Ui, is_focused: bool, viewer_open: bool, selected_image: &mut Option<usize>, was_clicked: &mut bool, should_open_viewer: &mut bool) {
+        println!("=== show_image_grid called with {} images ===", self.current_images.len());
+        println!("Thumbnails cache size: {}", self.thumbnails.len());
+        println!("Loading thumbnails: {}", self.loading_thumbnails.len());
+        
         // Clone the images to avoid borrowing issues
         let images_to_process = self.current_images.clone();
+        let cols = self.grid_cols;
+        
+        println!("Grid cols: {}, Images to process: {}", cols, images_to_process.len());
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             // Handle keyboard navigation only when focused and viewer is not open
@@ -86,7 +197,7 @@ impl ThumbnailGrid {
             };
             
             if open_viewer {
-                should_open_viewer = true;
+                *should_open_viewer = true;
             }
             
             // Calculate updated selection rect after keyboard input
@@ -97,10 +208,10 @@ impl ThumbnailGrid {
                 // The actual rendering uses UI layout positioning
                 Some(egui::Rect::from_min_size(
                     egui::Pos2::new(
-                        col as f32 * thumbnail_size,
-                        row as f32 * (thumbnail_size + 20.0), // Include text height
+                        col as f32 * self.thumbnail_size,
+                        row as f32 * (self.thumbnail_size + 20.0), // Include text height
                     ),
-                    egui::Vec2::new(thumbnail_size, thumbnail_size + 20.0),
+                    egui::Vec2::new(self.thumbnail_size, self.thumbnail_size + 20.0),
                 ))
             } else {
                 None
@@ -113,10 +224,12 @@ impl ThumbnailGrid {
                 }
             }
             // Manual grid layout with proper UI positioning
-            let item_height = thumbnail_size + 20.0;
+            let item_height = self.thumbnail_size + 20.0;
             let total_rows = (images_to_process.len() + cols - 1) / cols; // Ceiling division
             
-            // Use vertical layout for rows
+            // Render image grid efficiently
+            println!("🎨 Rendering {} images with {} thumbnails loaded", images_to_process.len(), self.thumbnails.len());
+            
             ui.vertical(|ui| {
                 for row in 0..total_rows {
                     ui.horizontal(|ui| {
@@ -129,108 +242,190 @@ impl ThumbnailGrid {
                             let image_file = &images_to_process[index];
                             let is_selected = self.selected_index == Some(index);
                             
+                            // Only log when thumbnail state changes
+                            if index < 5 || self.thumbnails.contains_key(&image_file.path) {
+                                println!("🖼️ {} - Thumbnail: {}", 
+                                    image_file.name, 
+                                    if self.thumbnails.contains_key(&image_file.path) { "Ready" } else { "Loading" }
+                                );
+                            }
+                            
                             let response = ui.allocate_response(
-                                egui::Vec2::new(thumbnail_size, item_height),
+                                egui::Vec2::new(self.thumbnail_size, item_height),
                                 egui::Sense::click(),
                             );
                             
-                            // Draw thumbnail
-                            if let Some(texture) = self.thumbnails.get(&image_file.path) {
-                                let image_rect = egui::Rect::from_min_size(
-                                    response.rect.min,
-                                    egui::Vec2::new(thumbnail_size, thumbnail_size),
+                            // Draw thumbnail or placeholder
+                            let image_rect = egui::Rect::from_min_size(
+                                response.rect.min,
+                                egui::Vec2::new(self.thumbnail_size, self.thumbnail_size),
+                            );
+                            
+                            if is_selected {
+                                ui.painter().rect_filled(
+                                    response.rect,
+                                    egui::Rounding::same(5.0),
+                                    egui::Color32::from_rgb(80, 120, 180), // Softer blue for selection
                                 );
-                                
-                                if is_selected {
-                                    ui.painter().rect_filled(
-                                        response.rect,
-                                        egui::Rounding::same(5.0),
-                                        egui::Color32::from_rgb(100, 150, 200),
-                                    );
-                                }
-                                
+                            }
+                            
+                            if let Some(texture) = self.thumbnails.get(&image_file.path) {
+                                println!("Found texture for {}, rendering with ID: {:?}", image_file.name, texture.id());
                                 ui.painter().image(
                                     texture.id(),
                                     image_rect,
                                     egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
                                     egui::Color32::WHITE,
                                 );
-                                
-                                // Draw filename
-                                let text_pos = egui::Pos2::new(response.rect.min.x, response.rect.min.y + thumbnail_size);
-                                ui.painter().text(
-                                    text_pos,
-                                    egui::Align2::LEFT_TOP,
-                                    &image_file.name,
-                                    egui::FontId::proportional(12.0),
-                                    if is_selected { egui::Color32::WHITE } else { ui.style().visuals.text_color() },
-                                );
                             } else {
-                                // Loading placeholder or error state
+                                println!("No texture for {}, rendering placeholder", image_file.name);
+                                // Show highly visible placeholder immediately when file is found
                                 let is_loading = self.loading_thumbnails.contains(&image_file.path);
+                                
+                                // Adjust placeholder colors to be less distracting
                                 let bg_color = if is_loading {
-                                    egui::Color32::from_gray(60)  // Dark gray for loading
+                                    egui::Color32::from_rgb(100, 100, 100) // Neutral gray for loading
                                 } else {
-                                    egui::Color32::from_rgb(80, 60, 60)  // Reddish for error
+                                    egui::Color32::from_rgb(150, 150, 150) // Slightly lighter gray for found but not loading
                                 };
                                 
+                                // Draw prominent background
                                 ui.painter().rect_filled(
-                                    response.rect,
-                                    egui::Rounding::same(5.0),
+                                    image_rect,
+                                    egui::Rounding::same(8.0),  // Larger rounding for visibility
                                     bg_color,
                                 );
                                 
-                                let center = response.rect.center();
-                                let text = if is_loading {
-                                    "読み込み中..."  // Japanese "Loading..."
-                                } else {
-                                    "エラー"  // Japanese "Error"
-                                };
+                                // Add thick white border for high contrast
+                                ui.painter().rect_stroke(
+                                    image_rect,
+                                    egui::Rounding::same(8.0),
+                                    egui::Stroke::new(3.0, egui::Color32::WHITE),
+                                );
                                 
+                                // Add inner border for extra visibility
+                                let inner_rect = image_rect.shrink(8.0);
+                                ui.painter().rect_stroke(
+                                    inner_rect,
+                                    egui::Rounding::same(4.0),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 200, 200)),
+                                );
+                                
+                                let center = image_rect.center();
+                                
+                                // Draw large image icon/symbol
                                 ui.painter().text(
-                                    center,
+                                    center + egui::Vec2::new(0.0, -15.0),
                                     egui::Align2::CENTER_CENTER,
-                                    text,
-                                    egui::FontId::default(),
+                                    "🖼️",  // Image emoji for immediate recognition
+                                    egui::FontId::proportional(24.0),
                                     egui::Color32::WHITE,
                                 );
+                                
+                                let status_text = if is_loading {
+                                    "読み込み中"
+                                } else {
+                                    "画像ファイル"
+                                };
+                                
+                                // Draw status text with larger font
+                                ui.painter().text(
+                                    center + egui::Vec2::new(0.0, 10.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    status_text,
+                                    egui::FontId::proportional(14.0),
+                                    egui::Color32::WHITE,
+                                );
+                                
+                                // Auto-start thumbnail loading in background after showing placeholder
+                                if !is_loading && !self.thumbnails.contains_key(&image_file.path) {
+                                    println!("Starting background thumbnail load for: {}", image_file.name);
+                                    self.load_thumbnail_async(&image_file.path, ui.ctx());
+                                }
                             }
+                            
+                            // Draw prominent filename - make file presence immediately obvious
+                            let display_name = if image_file.name.len() > 12 {
+                                format!("{}...", &image_file.name[..9])
+                            } else {
+                                image_file.name.clone()
+                            };
+                            
+                            let text_pos = egui::Pos2::new(response.rect.min.x, response.rect.min.y + self.thumbnail_size);
+                            
+                            // Draw larger text area for filename
+                            let text_rect = egui::Rect::from_min_size(
+                                text_pos,
+                                egui::Vec2::new(self.thumbnail_size, 20.0),
+                            );
+                            
+                            // Prominent background for filename visibility
+                            let filename_bg_color = if is_selected {
+                                egui::Color32::from_rgb(100, 150, 200)  // Blue when selected
+                            } else {
+                                egui::Color32::from_black_alpha(150)    // Semi-transparent black
+                            };
+                            
+                            ui.painter().rect_filled(
+                                text_rect,
+                                egui::Rounding::same(4.0),
+                                filename_bg_color,
+                            );
+                            
+                            // White border around filename for extra visibility
+                            ui.painter().rect_stroke(
+                                text_rect,
+                                egui::Rounding::same(4.0),
+                                egui::Stroke::new(1.0, egui::Color32::WHITE),
+                            );
+                            
+                            // Large, bold filename text
+                            ui.painter().text(
+                                text_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                &display_name,
+                                egui::FontId::proportional(11.0),  // Slightly larger font
+                                egui::Color32::WHITE,
+                            );
                             
                             if response.clicked() {
                                 self.selected_index = Some(index);
-                                selected_image = Some(index);
-                                was_clicked = true;
+                                *selected_image = Some(index);
+                                *was_clicked = true;
                             }
                             
                             // Handle double-click to open viewer
                             if response.double_clicked() {
                                 self.selected_index = Some(index);
-                                selected_image = Some(index);
-                                should_open_viewer = true;
+                                *selected_image = Some(index);
+                                *should_open_viewer = true;
                             }
                         }
                     });
                 }
             });
         });
-
-        // Load thumbnails for images that need it (after the immutable borrow ends)
-        let mut images_to_load = Vec::new();
-        for image_file in &images_to_process {
-            if !self.thumbnails.contains_key(&image_file.path) && 
-               !self.loading_thumbnails.contains(&image_file.path) {
-                images_to_load.push(image_file.clone());
-            }
+    }
+    
+    fn load_thumbnail_async(&mut self, path: &PathBuf, ctx: &egui::Context) {
+        if self.loading_thumbnails.contains(path) {
+            return;
         }
         
-        // Load thumbnails for new images
-        for image_file in images_to_load {
-            self.load_thumbnail(ui.ctx(), image_file);
+        self.loading_thumbnails.insert(path.clone());
+        
+        // For now, do synchronous loading but mark as loading for UI feedback
+        self.load_thumbnail_sync(path.clone(), ctx);
+    }
+    
+    fn load_thumbnail_sync(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let image_file = self.current_images.iter()
+            .find(|img| img.path == path)
+            .cloned();
+            
+        if let Some(image_file) = image_file {
+            self.load_thumbnail(ctx, image_file);
         }
-
-
-
-        (selected_image, was_clicked, should_open_viewer)
     }
 
     fn load_thumbnail(&mut self, ctx: &egui::Context, image_file: ImageFile) {
@@ -400,6 +595,13 @@ impl ThumbnailGrid {
 
     pub fn get_image_count(&self) -> usize {
         self.current_images.len()
+    }
+    
+    // Debug method to get detailed image information
+    pub fn get_image_debug_info(&self) -> (usize, Vec<String>) {
+        let count = self.current_images.len();
+        let names = self.current_images.iter().take(10).map(|img| img.name.clone()).collect();
+        (count, names)
     }
 
     pub fn get_current_image(&self) -> Option<&ImageFile> {

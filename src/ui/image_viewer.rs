@@ -1,5 +1,7 @@
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::ui::app::{AppState, ImageViewerAction};
 use crate::core::image_loader::ImageLoader;
@@ -10,16 +12,26 @@ pub struct ImageViewer {
     zoom_level: f32,
     pan_offset: egui::Vec2,
     error_message: Option<String>,
+    is_loading: bool,
+    // バックグラウンドでColorImageを生成し、UIスレッドでTexture化
+    result_sender: Option<mpsc::Sender<Result<egui::ColorImage, String>>>,
+    result_receiver: Option<mpsc::Receiver<Result<egui::ColorImage, String>>>,
+    notify: Arc<Notify>,
 }
 
 impl ImageViewer {
     pub fn new() -> Self {
+        let (sender, receiver) = mpsc::channel(1);
         Self {
             current_image: None,
             current_image_path: None,
             zoom_level: 1.0,
             pan_offset: egui::Vec2::ZERO,
             error_message: None,
+            is_loading: false,
+            result_sender: Some(sender),
+            result_receiver: Some(receiver),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -41,9 +53,41 @@ impl ImageViewer {
         // Load image if needed
         if let Some(image_file) = current_image_file {
             if self.current_image_path != Some(image_file.path.clone()) {
+                self.is_loading = true;
+                self.error_message = None;
                 self.load_image(ctx, &image_file.path);
                 self.current_image_path = Some(image_file.path.clone());
             }
+        }
+        // ポーリングしてロード結果を反映（ColorImage→TextureHandle化はUIスレッドで）
+        if let Some(receiver) = &mut self.result_receiver {
+            if let Some(res) = receiver.try_recv().ok().and_then(|x| Some(x)) {
+                match res {
+                    Ok(color_image) => {
+                        let texture = ctx.load_texture(
+                            format!("full_image_{}", self.current_image_path.as_ref().unwrap_or(&PathBuf::default()).display()),
+                            color_image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.current_image = Some(texture);
+                        self.is_loading = false;
+                    }
+                    Err(e) => {
+                        self.error_message = Some(e);
+                        self.is_loading = false;
+                    }
+                }
+            }
+        }
+
+        // 非同期通知を待機
+        if self.is_loading {
+            let notify = self.notify.clone();
+            let repaint_signal = ctx.clone().clone();
+            tokio::spawn(async move {
+                notify.notified().await;
+                repaint_signal.request_repaint();
+            });
         }
 
         // Full-screen modal
@@ -64,7 +108,38 @@ impl ImageViewer {
                 let image_rect = ui.available_rect_before_wrap();
                 
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(image_rect), |ui| {
-                    if let Some(texture) = &self.current_image {
+                    if self.is_loading {
+                        // Show loading state
+                        let center = ui.available_rect_before_wrap().center();
+                        ui.painter().text(
+                            center,
+                            egui::Align2::CENTER_CENTER,
+                            "画像を読み込み中...",  // "Loading image..."
+                            egui::FontId::proportional(24.0),
+                            egui::Color32::WHITE,
+                        );
+                    } else if let Some(error) = &self.error_message {
+                        // Show error state
+                        let center = ui.available_rect_before_wrap().center();
+                        ui.painter().text(
+                            center,
+                            egui::Align2::CENTER_CENTER,
+                            &format!("読み込みエラー: {}", error),  // "Loading error: {}"
+                            egui::FontId::proportional(18.0),
+                            egui::Color32::from_rgb(255, 150, 150),
+                        );
+                        
+                        // Show filename even when there's an error
+                        if let Some(image_file) = current_image_file {
+                            ui.painter().text(
+                                egui::Pos2::new(center.x, center.y + 40.0),
+                                egui::Align2::CENTER_CENTER,
+                                &format!("ファイル: {}", image_file.name),  // "File: {}"
+                                egui::FontId::proportional(14.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    } else if let Some(texture) = &self.current_image {
                         let texture_size = texture.size_vec2();
                         let available_size = ui.available_size();
                         
@@ -159,22 +234,16 @@ impl ImageViewer {
                                 self.zoom_level = (self.zoom_level * zoom_factor).clamp(0.1, 10.0);
                             }
                         });
-                    } else if let Some(error) = &self.error_message {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("エラー: {}", error))
-                                    .color(egui::Color32::RED)
-                                    .size(20.0)
-                            );
-                        });
                     } else {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(
-                                egui::RichText::new("読み込み中...")
-                                    .color(egui::Color32::WHITE)
-                                    .size(20.0)
-                            );
-                        });
+                        // Show placeholder when no image is loaded but not in error/loading state
+                        let center = ui.available_rect_before_wrap().center();
+                        ui.painter().text(
+                            center,
+                            egui::Align2::CENTER_CENTER,
+                            "画像なし",  // "No image"
+                            egui::FontId::proportional(18.0),
+                            egui::Color32::WHITE,
+                        );
                     }
                 });
             });
@@ -183,29 +252,30 @@ impl ImageViewer {
     }
     
     fn load_image(&mut self, ctx: &egui::Context, path: &PathBuf) {
+        use tokio::task;
         self.current_image = None;
         self.error_message = None;
         self.zoom_level = 1.0;
         self.pan_offset = egui::Vec2::ZERO;
-        
-        match ImageLoader::load_image(path) {
-            Ok(image) => {
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [image.width() as usize, image.height() as usize],
-                    &image.to_rgba8(),
-                );
-                
-                let texture = ctx.load_texture(
-                    format!("full_image_{}", path.display()),
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                );
-                
-                self.current_image = Some(texture);
-            }
-            Err(e) => {
-                self.error_message = Some(e.to_string());
-            }
-        }
+        self.is_loading = true;
+
+        let sender = self.result_sender.clone().unwrap();
+        let path = path.clone();
+        let notify = self.notify.clone();
+
+        task::spawn(async move {
+            let res = match ImageLoader::load_image(&path) {
+                Ok(image) => {
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [image.width() as usize, image.height() as usize],
+                        &image.to_rgba8(),
+                    );
+                    Ok(color_image)
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            sender.send(res).await.unwrap();
+            notify.notify_one();
+        });
     }
 }

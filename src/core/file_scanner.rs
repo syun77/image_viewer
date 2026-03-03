@@ -101,6 +101,41 @@ impl FileScanner {
         let dir_info = self.scan_directory(path)?;
         Ok(dir_info.image_files)
     }
+    
+    /// 逐次ロード用: ディレクトリ内の画像パス一覧を返す（イテレータ的）
+    pub fn get_image_paths_in_directory(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        let mut image_paths = Vec::new();
+        if !path.is_dir() {
+            return Ok(image_paths);
+        }
+        let entries = fs::read_dir(path)?;
+        for entry in entries {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry_path.is_file() && self.is_supported_image(&entry_path) {
+                if let Some(filename) = entry_path.file_name() {
+                    if filename.to_string_lossy().starts_with("._") {
+                        continue;
+                    }
+                }
+                image_paths.push(entry_path);
+            }
+        }
+        // ソート（日本語対応）
+        image_paths.sort_by(|a, b| natord::compare(&a.to_string_lossy(), &b.to_string_lossy()));
+        Ok(image_paths)
+    }
+
+    /// 逐次ロード用: 画像パスからImageFileを生成
+    pub fn load_image_file(&self, path: &Path) -> Result<ImageFile> {
+        let metadata = std::fs::metadata(path)?;
+        Ok(ImageFile {
+            path: path.to_path_buf(),
+            name: path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Unknown".to_string()),
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            size: metadata.len(),
+        })
+    }
 
     fn is_supported_image(&self, path: &Path) -> bool {
         if let Some(ext) = path.extension() {

@@ -1,17 +1,21 @@
 use image::{DynamicImage, GenericImageView};
 use std::path::Path;
 use anyhow::{Result, anyhow};
+use log::info;
 
 pub struct ImageLoader;
 
 impl ImageLoader {
     pub fn load_image(path: &Path) -> Result<DynamicImage> {
+        let start_time = std::time::Instant::now();
         let img = image::open(path)
             .map_err(|e| anyhow!("Failed to load image {}: {}", path.display(), e))?;
+        info!("Loaded image {} in {:?}", path.display(), start_time.elapsed());
         Ok(img)
     }
 
     pub fn generate_thumbnail(img: &DynamicImage, target_size: u32) -> Result<DynamicImage> {
+        let start_time = std::time::Instant::now();
         let (orig_width, orig_height) = img.dimensions();
         
         // Calculate new dimensions while maintaining aspect ratio
@@ -25,6 +29,7 @@ impl ImageLoader {
 
         // Use simple resize method
         let resized = img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
+        info!("Generated thumbnail in {:?}", start_time.elapsed());
         Ok(resized)
     }
 

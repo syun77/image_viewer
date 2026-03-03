@@ -11,6 +11,7 @@ fn main() -> Result<(), eframe::Error> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([800.0, 600.0]),
+        renderer: eframe::Renderer::Glow, // Ensure OpenGL renderer for better performance
         ..Default::default()
     };
 
@@ -20,6 +21,10 @@ fn main() -> Result<(), eframe::Error> {
         Box::new(|cc| {
             // Setup Japanese font support
             setup_custom_fonts(&cc.egui_ctx);
+            
+            // Enable continuous mode for high-frequency updates
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            
             Ok(Box::new(ImageViewerApp::new(cc)))
         }),
     )
